@@ -5,30 +5,20 @@ import (
 	"net"
 	"os/exec"
 	"os/signal"
-	// "strconv"
-
+	"sync"
 	"os"
-
-	// "github.com/joho/godotenv"
 	"github.com/songgao/water"
 )
 
 
 func main() {
-
-	// err := godotenv.Load()
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// portString := os.Getenv("PORT")
-	// port, err := strconv.ParseInt(portString, 10, 64)
     ifce, err := water.New(water.Config{DeviceType: water.TUN})
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	cmd := exec.Command("ip", "addr", "add", "10.1.0.20", "peer", "10.1.0.10", "dev", ifce.Name())
+	cmd := exec.Command("sudo", "ip", "addr", "add", "10.1.0.1/24", "dev", ifce.Name())
 	if err := cmd.Run(); err != nil {
 		log.Fatalf("Ошибка назначения IP на сервере: %v", err)
 	}
@@ -39,7 +29,8 @@ func main() {
 	}
     lst, _ := net.ListenUDP("udp", &net.UDPAddr{Port: 9999})
 
-	var clientAddr *net.UDPAddr 
+	var clientMap = make(map[string]*net.UDPAddr)
+	mutex := &sync.RWMutex{}
 	go func () {
 		packet := make([]byte, 2000)
 		for {
@@ -49,7 +40,17 @@ func main() {
 			}
 			ifce.Write(packet[:n])
 			log.Printf("Получено от %s и записано в TUN: %d байт", addr, n)
-			clientAddr = addr
+			version := packet[0] >> 4
+			var srcIp string
+			switch version {
+			case 4:
+				srcIp = net.IP(packet[12:16]).String()
+			// case 6:
+			// 	srcIp = net.IP(packet[8:24]).String()
+			}
+			mutex.Lock()
+			clientMap[srcIp] = addr
+			mutex.Unlock()			
 		}
 	}()
 
@@ -60,14 +61,23 @@ func main() {
 			if err != nil {
 				continue
 			}
-			if clientAddr == nil {
-            	continue 
-        	}
-			n, err = lst.WriteToUDP(buf[:n], clientAddr)
-			if err != nil {
-				continue
+			version := buf[0] >> 4
+			if version == 4 {
+				dstIp := net.IP(buf[16:20]).String()
+
+				mutex.RLock()
+				targetAddr, exists := clientMap[dstIp]
+				mutex.RUnlock()
+
+				if exists {
+					_, err = lst.WriteToUDP(buf[:n], targetAddr)
+					if err != nil {
+						log.Printf("Ошибка отправки клиенту %s: %v", dstIp, err)
+					} else {
+						log.Printf("Отправлено ответ клиенту %s (%s)", dstIp, targetAddr)
+					}
+				}
 			}
-			log.Printf("Клиенту отправлено %d байт", n)
 		}
 	}()
 
